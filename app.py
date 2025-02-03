@@ -6,9 +6,10 @@ from translator.word_translator import WordTranslator
 from translator.pdf_translator import PdfTranslator
 from llmWrapper.ollama_wrapper import populate_sum_model
 from typing import List, Tuple
-
 # Import language configs
 from config.languages_config import LANGUAGE_MAP, LABEL_TRANSLATIONS
+
+QUEUE_COUNTER = 0
 
 # 1) Main file translation function
 def translate_file(
@@ -165,8 +166,42 @@ def init_ui(request: gr.Request):
     user_lang = get_user_lang(request)
     return [user_lang] + list(set_labels(user_lang).values())
 
+def get_queue_status():
+    global QUEUE_COUNTER
+    if QUEUE_COUNTER > 1:
+        return f"排队中，前面还有 {QUEUE_COUNTER - 1} 个用户"
+    elif QUEUE_COUNTER == 1:
+        return "正在处理当前任务，请稍等..."
+    else:
+        return "没有其他用户在排队。"
 
-# 5) Build Gradio interface
+def update_queue_count(increment=True):
+    global QUEUE_COUNTER
+    if increment:
+        QUEUE_COUNTER += 1
+    else:
+        QUEUE_COUNTER = max(0, QUEUE_COUNTER - 1)
+
+# Modified translation function to handle button state
+def translate_file_with_state(
+    file, model, src_lang, dst_lang, use_online, api_key, max_token,
+    progress=gr.Progress(track_tqdm=True)
+):
+    """Wrapper for translate_file that handles button state."""
+    try:
+        # Actual translation
+        file_output, status = translate_file(
+            file, model, src_lang, dst_lang, use_online, api_key, max_token, progress
+        )
+        return file_output, status, gr.update(interactive=True)
+    except Exception as e:
+        return (
+            gr.update(value=None, visible=False),
+            f"Error: {str(e)}",
+            gr.update(interactive=True)
+        )
+
+# Build Gradio interface
 with gr.Blocks() as demo:
     session_lang = gr.State("en")
 
@@ -207,6 +242,7 @@ with gr.Blocks() as demo:
     )
     output_file = gr.File(label="Download Translated File", visible=False)
     status_message = gr.Textbox(label="Status Message", interactive=False, visible=True)
+    queue_status_display = gr.Textbox(label="Queue Status", value="没有其他用户在排队。", interactive=False)
     translate_button = gr.Button("Translate")
 
     use_online_model.change(
@@ -215,21 +251,42 @@ with gr.Blocks() as demo:
         outputs=[model_choice, api_key_input]
     )
 
-    # Hide download button and reset status first
+    # Handle button state and translation
     translate_button.click(
-        lambda: (gr.update(visible=False), None),
+        lambda: (gr.update(visible=False), None, gr.update(interactive=False)),
         inputs=[],
-        outputs=[output_file, status_message]
-    )
-
-    # Then translate
-    translate_button.click(
-        translate_file,
+        outputs=[output_file, status_message, translate_button]
+    ).then(
+        lambda: (update_queue_count(increment=True)),
+        inputs=[],
+        outputs=[]
+    ).then(
+        get_queue_status,
+        inputs=[],
+        outputs=[queue_status_display]  # 更新队列状态到文本框
+    ).then(
+        lambda: gr.update(interactive=False),  # 灰色禁用按钮
+        inputs=[],
+        outputs=[translate_button]
+    ).then(
+        translate_file_with_state,
         inputs=[
-            file_input, model_choice, src_lang, dst_lang, 
+            file_input, model_choice, src_lang, dst_lang,
             use_online_model, api_key_input, max_token
         ],
-        outputs=[output_file, status_message]
+        outputs=[output_file, status_message, translate_button]
+    ).then(
+        lambda: update_queue_count(increment=False),
+        inputs=[],
+        outputs=[]
+    ).then(
+        get_queue_status,
+        inputs=[],
+        outputs=[queue_status_display]  # 任务结束后更新状态
+    ).then(
+        lambda: gr.update(interactive=True),  # 恢复按钮
+        inputs=[],
+        outputs=[translate_button]
     )
 
     # On page load, set user language and labels
@@ -243,4 +300,6 @@ with gr.Blocks() as demo:
         ]
     )
 
-demo.launch(server_port=9980, share=True)
+# Enable queue with concurrency limit
+demo.queue(default_concurrency_limit=1)
+demo.launch(server_port=9980, share=False, show_error=False)
